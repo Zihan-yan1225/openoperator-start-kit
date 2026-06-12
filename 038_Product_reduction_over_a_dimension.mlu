@@ -1,0 +1,95 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+// Kernel：沿指定维度做连乘归约
+// 支持 dim=0,1,2，输入形状 [batch, dim1, dim2]
+__mlu_entry__ void product_reduce_kernel(
+    float* input,
+    float* output,
+    int outer,    // 归约维度之外的"外层"元素数
+    int reduce,   // 归约维度的大小
+    int inner     // 归约维度之后的"内层"元素数
+) {
+    uint32_t core_id  = taskId;
+    uint32_t core_num = taskDim;
+
+    int total_out = outer * inner; // 输出元素总数
+
+    uint32_t per_core = total_out / core_num;
+    uint32_t remainder = total_out % core_num;
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_buf[CHUNK_SIZE];
+
+    for (uint32_t idx = start; idx < start + count; idx++) {
+        int o = idx / inner;
+        int i = idx % inner;
+
+        float prod = 1.0f;
+        for (int r = 0; r < reduce; r++) {
+            // 原始索引：[o*reduce*inner + r*inner + i]
+            int src_idx = o * reduce * inner + r * inner + i;
+            float val;
+            __memcpy(&val, input + src_idx, sizeof(float), GDRAM2NRAM);
+            prod *= val;
+        }
+        __memcpy(output + idx, &prod, sizeof(float), NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input, int64_t dim) {
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dim() == 3, "Input must be 3D tensor [batch, dim1, dim2]");
+    TORCH_CHECK(dim >= 0 && dim < 3, "dim must be 0, 1, or 2");
+
+    auto original_dtype = input.scalar_type();
+
+    // 统一转为 float32 计算
+    torch::Tensor input_fp32 = (original_dtype != torch::kFloat)
+        ? input.to(torch::kFloat)
+        : input;
+
+    // 确保内存连续
+    input_fp32 = input_fp32.contiguous();
+
+    int batch = input_fp32.size(0);
+    int d1    = input_fp32.size(1);
+    int d2    = input_fp32.size(2);
+
+    // 计算 outer, reduce, inner
+    int outer, reduce, inner;
+    std::vector<int64_t> out_shape;
+
+    if (dim == 0) {
+        outer = 1; reduce = batch; inner = d1 * d2;
+        out_shape = {d1, d2};
+    } else if (dim == 1) {
+        outer = batch; reduce = d1; inner = d2;
+        out_shape = {batch, d2};
+    } else { // dim == 2
+        outer = batch * d1; reduce = d2; inner = 1;
+        out_shape = {batch, d1};
+    }
+
+    auto output_fp32 = torch::empty(out_shape,
+        torch::TensorOptions().dtype(torch::kFloat).device(input_fp32.device()));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim3  = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    product_reduce_kernel<<<dim3, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        outer, reduce, inner
+    );
+
+    // 转回原始数据类型（float16）
+    return (original_dtype != torch::kFloat)
+        ? output_fp32.to(original_dtype)
+        : output_fp32;
+}
